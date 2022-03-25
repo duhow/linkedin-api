@@ -89,7 +89,7 @@ class Client(object):
     def cookies(self):
         return self.session.cookies
 
-    def authenticate(self, username, password):
+    def authenticate(self, username, password, challenge=None):
         if self._use_cookie_cache:
             self.logger.debug("Attempting to use cached cookies")
             cookies = self._cookie_repository.get(username)
@@ -99,7 +99,7 @@ class Client(object):
                 self._fetch_metadata()
                 return
 
-        self._do_authentication_request(username, password)
+        self._do_authentication_request(username, password, challenge)
         self._fetch_metadata()
 
     def _fetch_metadata(self):
@@ -129,7 +129,28 @@ class Client(object):
         self.metadata["clientApplicationInstance"] = clientApplicationInstance
         self.metadata["clientPageInstanceId"] = clientPageInstanceId
 
-    def _do_authentication_request(self, username, password):
+    def _extract_challenge_fields(self, request):
+        """ Get the challenge url and extract fields required """
+        soup = BeautifulSoup(request.text, "lxml")
+
+        payload = dict()
+
+        for field_name in [
+            "csrfToken", "resendUrl", "language", "displayTime", "pageInstance",
+            "failureRedirectUri", "flowTreeId", "signInLink", "joinNowLink",
+            "requestSubmissionId",
+            "challengeId", "challengeType", "challengeSource", "challengeData",
+            "challengeDetails"
+        ]:
+            field = soup.find("input", attrs={"name": field_name})
+            if field:
+                payload[field_name] = field.attrs["value"]
+            else:
+                logging.debug(f"Field {field_name} not found")
+
+        return payload
+
+    def _do_authentication_request(self, username, password, challenge=None):
         """
         Authenticate with Linkedin.
 
@@ -152,6 +173,35 @@ class Client(object):
         )
 
         data = res.json()
+        #logging.debug(data)
+
+        if data and data["login_result"] == "CHALLENGE" and challenge:
+            res = requests.post(
+                data["challenge_url"],
+                data=payload,
+                cookies=self.session.cookies,
+                headers=Client.AUTH_REQUEST_HEADERS,
+                proxies=self.proxies,
+            )
+
+            payload = self._extract_challenge_fields(res)
+
+            # add OTP challenge value
+            payload["pin"] = challenge
+
+            res = requests.post(
+                f"{Client.LINKEDIN_BASE_URL}/checkpoint/challenge/verify",
+                data=payload,
+                cookies=self.session.cookies,
+                headers=Client.AUTH_REQUEST_HEADERS,
+                proxies=self.proxies,
+            )
+
+            data = res.json()
+            print(data)
+
+            if "isn&#39;t valid" in res.text:
+                raise ChallengeException("Invalid challenge code")
 
         if data and data["login_result"] != "PASS":
             raise ChallengeException(data["login_result"])
